@@ -1,0 +1,99 @@
+name: Sharded DR Checker (DR4)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check_dr_shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run shard ${{ matrix.shard }}
+        env:
+          AHREFS_API_KEYS: ${{ secrets.AHREFS_API_KEYS }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: 11
+        run: python check_dr_parallel.py
+
+      - name: Commit this shard's results
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          mkdir -p results
+          git add results/shard_${{ matrix.shard }}.csv
+          git diff --staged --quiet && exit 0
+          git commit -m "shard ${{ matrix.shard }} results"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash origin ${{ github.ref_name }} && \
+              git push origin HEAD:${{ github.ref_name }} && break
+            echo "Push retry $i..."
+            sleep 10
+          done
+
+  merge:
+    needs: check_dr_shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Merge shard files into dr_results.csv
+        run: |
+          python - <<'PY'
+          import csv, glob
+          rows = {}
+          for f in sorted(glob.glob("results/shard_*.csv")):
+              with open(f, newline="", encoding="utf-8") as fh:
+                  r = csv.reader(fh)
+                  next(r, None)
+                  for row in r:
+                      if row:
+                          rows[row[0]] = row
+          with open("dr_results.csv", "w", newline="", encoding="utf-8") as fh:
+              w = csv.writer(fh)
+              w.writerow(["target", "domain_rating", "error"])
+              for row in rows.values():
+                  w.writerow(row)
+          print(f"Merged {len(rows)} unique targets")
+          PY
+
+      - name: Commit merged file
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add dr_results.csv
+          git diff --staged --quiet || git commit -m "update merged dr_results.csv"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash origin ${{ github.ref_name }} && \
+              git push origin HEAD:${{ github.ref_name }} && break
+            echo "Push retry $i..."
+            sleep 10
+          done
